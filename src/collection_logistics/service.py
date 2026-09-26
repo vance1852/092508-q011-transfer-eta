@@ -5,13 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
-from .clock import SystemClock, parse_utc, utc_text
+from .clock import SystemClock, parse_utc, shift_minutes, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario
+from .models import RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario, response_minutes_value
 from .planning import (
     AllocationRequest,
     RiskPoint,
@@ -225,7 +224,19 @@ class CollectionLogisticsService:
         row = self.connection.execute("SELECT * FROM road_corridors WHERE corridor_id=?", (corridor_id,)).fetchone()
         if row is None:
             raise NotFound("转运路线不存在")
-        return dict(row)
+        result = dict(row)
+        result["response_minutes"] = self._stored_response_minutes(corridor_id, row["response_minutes"])
+        return result
+
+    @staticmethod
+    def _stored_response_minutes(corridor_id: str, value: object) -> int:
+        """读取历史登记的响应时长：单位统一为分钟，无法无歧义识别时明确报错而不是静默猜测。"""
+        try:
+            return response_minutes_value(value)
+        except ValidationFailed as exc:
+            raise InvalidState(
+                f"转运路线 {corridor_id} 的响应时长记录无法按分钟无歧义识别（{exc}），需人工修正后重试"
+            ) from exc
 
     def announce_restriction(
         self,
@@ -422,6 +433,9 @@ class CollectionLogisticsService:
             raise NotFound("调度申请不存在")
         if dispatch_request["state"] != "allocated" or dispatch_request["revision"] != expected_revision:
             raise InvalidState("调度申请不是当前可资源到场版本")
+        response_minutes = self._stored_response_minutes(
+            dispatch_request["corridor_id"], dispatch_request["response_minutes"]
+        )
         lot = self.connection.execute("SELECT * FROM preservation_resource_lots WHERE preservation_resource_lot_id=?", (preservation_resource_lot_id,)).fetchone()
         if lot is None:
             raise NotFound("应急资源批次不存在")
@@ -462,7 +476,7 @@ class CollectionLogisticsService:
             "state": "in_transit",
             "deployed_units": decimal_text(allocated),
             "expected_arrived_units": decimal_text(expected_delivery),
-            "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=int(dispatch_request["response_minutes"]))),
+            "expected_arrival": utc_text(shift_minutes(parse_utc(departed_at, "departed_at"), response_minutes)),
         }
 
     def create_scenario(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:

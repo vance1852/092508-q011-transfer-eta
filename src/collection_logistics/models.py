@@ -17,6 +17,9 @@ RISK_INDEXES = {"HUMIDITY", "INJURY", "CONGESTION", "HAZMAT", "SECONDARY", "CUST
 RESOURCE_KINDS = {"preservation-box", "tow-truck", "ambulance", "warning-kit", "evidence-kit", "rapid-response-team"}
 CENTER_KINDS = {"road-section", "receiving-vault", "herbarium-room", "storage", "patrol-station"}
 
+# 转运响应时长统一以分钟计；上限一周，超出即视为配置错误而非合理排班。
+MAX_RESPONSE_MINUTES = 7 * 24 * 60
+
 
 def required_text(value: object, field: str, maximum: int = 256) -> str:
     if not isinstance(value, str) or not value.strip():
@@ -56,9 +59,14 @@ def decimal_value(
     return result
 
 
-def positive_integer(value: object, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValidationFailed(f"{field} 必须是正整数")
+def response_minutes_value(value: object, field: str = "response_minutes") -> int:
+    """校验以分钟为单位的转运响应时长，拒绝零值、负值和超出合理范围的配置。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationFailed(f"{field} 必须是以分钟为单位的整数")
+    if value <= 0:
+        raise ValidationFailed(f"{field} 必须大于 0 分钟")
+    if value > MAX_RESPONSE_MINUTES:
+        raise ValidationFailed(f"{field} 不能超过 {MAX_RESPONSE_MINUTES} 分钟")
     return value
 
 
@@ -155,7 +163,7 @@ class RoadCorridor:
                 raw.get("hourly_capacity"), "hourly_capacity", minimum=Decimal("0.001")
             ),
             delay_basis_points=loss,
-            response_minutes=positive_integer(raw.get("response_minutes"), "response_minutes"),
+            response_minutes=response_minutes_value(raw.get("response_minutes")),
         )
 
 

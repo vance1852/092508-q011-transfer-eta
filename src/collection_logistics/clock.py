@@ -38,3 +38,16 @@ def parse_utc(value: str, field: str = "时间") -> datetime:
     if parsed.tzinfo is None:
         raise ValueError(f"{field} 必须包含时区")
     return parsed.astimezone(timezone.utc)
+
+
+def shift_minutes(moment: datetime, minutes: int) -> datetime:
+    """在带时区的时刻上按真实经过的分钟数平移。
+
+    先归一到 UTC 再相加，因此跨日和夏令时切换（本地时间跳跃或重复）
+    不影响经过时长，结果始终是明确的 UTC 时刻。
+    """
+    if moment.tzinfo is None:
+        raise ValueError("时刻必须带时区")
+    if isinstance(minutes, bool) or not isinstance(minutes, int) or minutes < 0:
+        raise ValueError("分钟数必须是非负整数")
+    return moment.astimezone(timezone.utc) + timedelta(minutes=minutes)

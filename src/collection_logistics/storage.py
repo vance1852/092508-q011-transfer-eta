@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS road_corridors (
     preservation_resource_kind TEXT NOT NULL,
     hourly_capacity TEXT NOT NULL,
     delay_basis_points INTEGER NOT NULL,
-    response_minutes INTEGER NOT NULL,
+    response_minutes INTEGER NOT NULL CHECK(response_minutes > 0 AND response_minutes <= 10080),
     revision INTEGER NOT NULL DEFAULT 1,
     state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','suspended','retired')),
     created_at TEXT NOT NULL,
