@@ -8,7 +8,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
-from .clock import parse_utc
+from .clock import load_timezone, parse_utc
 from .errors import ValidationFailed
 
 
@@ -16,6 +16,13 @@ IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{1,63}$")
 RISK_INDEXES = {"HUMIDITY", "INJURY", "CONGESTION", "HAZMAT", "SECONDARY", "CUSTOM"}
 RESOURCE_KINDS = {"preservation-box", "tow-truck", "ambulance", "warning-kit", "evidence-kit", "rapid-response-team"}
 CENTER_KINDS = {"road-section", "receiving-vault", "herbarium-room", "storage", "patrol-station"}
+
+# 转运响应时长统一以分钟为规范单位：活体样品需在一日内送达冷藏室，
+# 超过 24 小时（1440 分钟）的路线配置视为不合理，写入前拒绝。
+MAX_RESPONSE_MINUTES = 1440
+MAX_RESPONSE_HOURS = 24
+# 旧记录迁移时允许显式声明的单位；unknown 表示无法无歧义识别。
+RESPONSE_TIME_UNITS = {"minute", "hour", "unknown"}
 
 
 def required_text(value: object, field: str, maximum: int = 256) -> str:
@@ -56,10 +63,59 @@ def decimal_value(
     return result
 
 
-def positive_integer(value: object, field: str) -> int:
+def response_duration(value: object, field: str = "response_minutes") -> int:
+    """解析规范字段 response_minutes：分钟、正整数、不超过一日。
+
+    拒绝 bool、浮点、负数、零和超出合理范围的值，避免 45 被当成小时
+    或 0/负值让预计到达时间早于出发时刻。
+    """
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValidationFailed(f"{field} 必须是正整数")
+        raise ValidationFailed(f"{field} 必须是正整数分钟")
+    if value > MAX_RESPONSE_MINUTES:
+        raise ValidationFailed(f"{field} 不能超过 {MAX_RESPONSE_MINUTES} 分钟（24 小时）")
     return value
+
+
+def resolve_legacy_duration(raw: Mapping[str, Any]) -> tuple[int | None, str]:
+    """解析可能带单位的旧登记字段，返回 (分钟数或 None, 质量标记)。
+
+    - response_minutes（现行规范字段）：按分钟校验，质量为 minute。
+    - response_time + response_time_unit：旧记录可显式声明 minute/hour，
+      归一化为分钟；声明 unknown 或无法识别时返回 (None, "ambiguous")，
+      由调用方明确标记，绝不静默猜测。
+    - 两个字段都缺失：同样视为 ambiguous，等待人工澄清。
+    """
+    has_minutes = "response_minutes" in raw and raw.get("response_minutes") is not None
+    has_legacy = "response_time" in raw and raw.get("response_time") is not None
+    if "response_minutes" in raw and raw.get("response_minutes") is None:
+        raise ValidationFailed("response_minutes 不能为空，旧记录请改用 response_time_unit 标记")
+    if has_minutes and has_legacy:
+        raise ValidationFailed("response_minutes 与 response_time 不能同时提供，请只登记分钟数")
+    if has_minutes:
+        return response_duration(raw.get("response_minutes"), "response_minutes"), "minute"
+    if not has_legacy:
+        raise ValidationFailed("response_minutes 必填（正整数分钟）")
+
+    duration = raw.get("response_time")
+    if isinstance(duration, bool) or not isinstance(duration, int) or duration <= 0:
+        raise ValidationFailed("response_time 必须是正整数")
+    unit_text = raw.get("response_time_unit", "unknown")
+    if not isinstance(unit_text, str) or unit_text.strip().lower() not in RESPONSE_TIME_UNITS:
+        raise ValidationFailed("response_time_unit 必须是 minute、hour 或 unknown")
+    unit = unit_text.strip().lower()
+    if unit == "unknown":
+        return None, "ambiguous"
+    if unit == "minute":
+        if duration > MAX_RESPONSE_MINUTES:
+            raise ValidationFailed(f"response_time 不能超过 {MAX_RESPONSE_MINUTES} 分钟（24 小时）")
+        return duration, "minute"
+    # hour
+    if duration > MAX_RESPONSE_HOURS:
+        raise ValidationFailed(f"response_time 不能超过 {MAX_RESPONSE_HOURS} 小时")
+    minutes = duration * 60
+    if minutes > MAX_RESPONSE_MINUTES:
+        raise ValidationFailed(f"response_time 换算后不能超过 {MAX_RESPONSE_MINUTES} 分钟（24 小时）")
+    return minutes, "hour"
 
 
 def date_text(value: object, field: str) -> str:
@@ -111,8 +167,10 @@ class ResponseCenter:
         if kind not in CENTER_KINDS:
             raise ValidationFailed("kind 不是受支持的设施类型")
         timezone = required_text(raw.get("timezone"), "timezone", 64)
-        if "/" not in timezone and timezone != "UTC":
-            raise ValidationFailed("timezone 必须是 IANA 时区或 UTC")
+        try:
+            load_timezone(timezone, "timezone")
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
         return cls(
             center_id=identifier(raw.get("center_id"), "center_id"),
             name=required_text(raw.get("name"), "name"),
@@ -132,7 +190,12 @@ class RoadCorridor:
     preservation_resource_kind: str
     hourly_capacity: Decimal
     delay_basis_points: int
-    response_minutes: int
+    response_minutes: int | None
+    response_time_unit: str
+
+    @property
+    def duration_ambiguous(self) -> bool:
+        return self.response_minutes is None
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "RoadCorridor":
@@ -146,6 +209,7 @@ class RoadCorridor:
         destination = identifier(raw.get("destination_center_id"), "destination_center_id")
         if origin == destination:
             raise ValidationFailed("转运路线起点和终点不能相同")
+        minutes, unit = resolve_legacy_duration(raw)
         return cls(
             corridor_id=identifier(raw.get("corridor_id"), "corridor_id"),
             origin_center_id=origin,
@@ -155,7 +219,8 @@ class RoadCorridor:
                 raw.get("hourly_capacity"), "hourly_capacity", minimum=Decimal("0.001")
             ),
             delay_basis_points=loss,
-            response_minutes=positive_integer(raw.get("response_minutes"), "response_minutes"),
+            response_minutes=minutes,
+            response_time_unit=unit,
         )
 
 

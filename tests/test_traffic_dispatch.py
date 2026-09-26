@@ -8,10 +8,11 @@ from decimal import Decimal
 
 from collection_logistics.api import JsonApplication
 from collection_logistics.clock import FrozenClock
-from collection_logistics.errors import Conflict, Forbidden
+from collection_logistics.errors import Conflict, Forbidden, InvalidState, ValidationFailed
 from collection_logistics.planning import AllocationRequest, RiskPoint, allocate_capacity, latest_streak
 from collection_logistics.service import CollectionLogisticsService
 from collection_logistics.risk import DemandBucket, inventory_coverage, mark_to_risk, traffic_gap
+from collection_logistics.storage import initialize
 
 
 class PlanningTests(unittest.TestCase):
@@ -129,6 +130,164 @@ class CollectionLogisticsServiceTests(unittest.TestCase):
         response = app.handle("GET", "/risk_records/summary/HUMIDITY", {"X-Actor-Id": "plan"})
         self.assertEqual(response.status, 404)
         self.assertEqual(response.body["error"]["code"], "not_found")
+
+    def test_response_minutes_must_be_minutes_within_sane_range(self) -> None:
+        for bad in (0, -45, 1441, 45.0, True, "45", None):
+            with self.assertRaises(ValidationFailed):
+                RoadCorridor = self.route_payload(bad)
+                self.service.create_route("plan", RoadCorridor)
+        route = self.service.create_route("plan", self.route_payload(45, corridor_id="ok-45"))
+        self.assertEqual(route["response_minutes"], 45)
+        self.assertFalse(route["duration_ambiguous"])
+        self.assertEqual(route["response_minutes_text"], "45 分钟")
+        self.assertEqual(route["response_hours"], "0.75")
+
+    @staticmethod
+    def route_payload(response_minutes: object, *, corridor_id: str = "bad-route") -> dict[str, object]:
+        return {
+            "corridor_id": corridor_id,
+            "origin_center_id": "collection-east",
+            "destination_center_id": "receiving-vault-b",
+            "preservation_resource_kind": "preservation-box",
+            "hourly_capacity": "10",
+            "delay_basis_points": 0,
+            "response_minutes": response_minutes,
+        }
+
+    def test_expected_arrival_adds_minutes_not_hours(self) -> None:
+        self.service.create_route("plan", self.route_payload(45, corridor_id="cold-45"))
+        self.service.add_inventory_lot("dispatch", {"preservation_resource_lot_id": "lot-45", "center_id": "collection-east", "preservation_resource_kind": "preservation-box", "grade": "A", "quantity_units": "10", "unit_cost_cny": "1", "received_at": "2026-09-24T06:00:00Z"})
+        self.service.submit_dispatch("dispatch", {"dispatch_id": "nom-45", "corridor_id": "cold-45", "specimen_event_id": "bug-live", "duty_date": "2026-09-25", "requested_units": "1", "priority": 10, "idempotency_key": "key-45"})
+        self.service.allocate("dispatch", "cold-45", "2026-09-25")
+        deployment = self.service.dispatch_deployment("dispatch", "dep-45", "nom-45", "lot-45", 2)
+        self.assertEqual(deployment["departed_at"], "2026-09-24T08:00:00Z")
+        self.assertEqual(deployment["expected_arrival"], "2026-09-24T08:45:00Z")
+        self.assertEqual(deployment["expected_arrival_local"], "2026-09-24T16:45:00+08:00")
+        history = self.service.deployment("dep-45", "dispatch")
+        self.assertFalse(history["overdue"])
+
+    def test_overdue_flips_after_eta_and_clears_on_early_arrival(self) -> None:
+        # 提前签收：在 ETA（08:45）之前以实际到达时刻 08:40 签收，判定不超时。
+        self.service.create_route("plan", self.route_payload(45, corridor_id="cold-early"))
+        self.service.add_inventory_lot("dispatch", {"preservation_resource_lot_id": "lot-early", "center_id": "collection-east", "preservation_resource_kind": "preservation-box", "grade": "A", "quantity_units": "10", "unit_cost_cny": "1", "received_at": "2026-09-24T06:00:00Z"})
+        self.service.submit_dispatch("dispatch", {"dispatch_id": "nom-early", "corridor_id": "cold-early", "specimen_event_id": "bug-early", "duty_date": "2026-09-25", "requested_units": "1", "priority": 10, "idempotency_key": "key-early"})
+        self.service.allocate("dispatch", "cold-early", "2026-09-25")
+        self.service.dispatch_deployment("dispatch", "dep-early", "nom-early", "lot-early", 2)
+        delivered = self.service.confirm_arrival("dispatch", "dep-early", "2026-09-24T08:40:00Z")
+        self.assertFalse(delivered["overdue"])
+        self.assertEqual(delivered["state"], "delivered")
+        # 未签收单：时钟越过 ETA 后立即判超时。
+        self.service.create_route("plan", self.route_payload(45, corridor_id="cold-due"))
+        self.service.add_inventory_lot("dispatch", {"preservation_resource_lot_id": "lot-due", "center_id": "collection-east", "preservation_resource_kind": "preservation-box", "grade": "A", "quantity_units": "10", "unit_cost_cny": "1", "received_at": "2026-09-24T06:00:00Z"})
+        self.service.submit_dispatch("dispatch", {"dispatch_id": "nom-due", "corridor_id": "cold-due", "specimen_event_id": "bug-due", "duty_date": "2026-09-25", "requested_units": "1", "priority": 10, "idempotency_key": "key-due"})
+        self.service.allocate("dispatch", "cold-due", "2026-09-25")
+        self.service.dispatch_deployment("dispatch", "dep-due", "nom-due", "lot-due", 2)
+        self.clock.advance(minutes=46)
+        self.assertTrue(self.service.deployment("dep-due", "dispatch")["overdue"])
+
+    def test_ambiguous_legacy_route_is_flagged_and_blocks_dispatch(self) -> None:
+        payload = self.route_payload(45, corridor_id="legacy-x")
+        payload.pop("response_minutes")
+        payload.update({"response_time": 45, "response_time_unit": "unknown"})
+        route = self.service.create_route("plan", payload)
+        self.assertTrue(route["duration_ambiguous"])
+        self.assertIsNone(route["response_minutes"])
+        self.assertIn("ambiguous", route["duration_note"])
+        with self.assertRaises(InvalidState):
+            self.service.submit_dispatch("dispatch", {"dispatch_id": "nom-x", "corridor_id": "legacy-x", "specimen_event_id": "bug-x", "duty_date": "2026-09-25", "requested_units": "1", "priority": 10, "idempotency_key": "key-x"})
+        with self.assertRaises(ValidationFailed):
+            self.service.clarify_route_duration("plan", "legacy-x", 0)
+        clarified = self.service.clarify_route_duration("plan", "legacy-x", 45)
+        self.assertEqual(clarified["response_minutes"], 45)
+        self.assertFalse(clarified["duration_ambiguous"])
+
+    def test_legacy_hours_normalize_to_minutes(self) -> None:
+        payload = self.route_payload(2, corridor_id="legacy-h")
+        payload.pop("response_minutes")
+        payload.update({"response_time": 2, "response_time_unit": "hour"})
+        route = self.service.create_route("plan", payload)
+        self.assertEqual(route["response_minutes"], 120)
+        self.assertEqual(route["response_time_unit"], "hour")
+
+    def test_missing_duration_is_rejected_not_silently_ambiguous(self) -> None:
+        payload = self.route_payload(45, corridor_id="no-duration")
+        payload.pop("response_minutes")
+        with self.assertRaises(ValidationFailed):
+            self.service.create_route("plan", payload)
+        with self.assertRaises(ValidationFailed):
+            self.service.create_route("plan", {**self.route_payload(45, corridor_id="bad-unit"),
+                                               "response_minutes": None})
+
+    def test_api_surface_uses_single_semantics(self) -> None:
+        app = JsonApplication(self.service)
+        created = app.handle("POST", "/road_corridors", {"X-Actor-Id": "plan"}, json.dumps(self.route_payload(45, corridor_id="api-45")).encode())
+        self.assertEqual(created.status, 201)
+        self.assertEqual(created.body["response_minutes"], 45)
+        shown = app.handle("GET", "/road_corridors/api-45", {"X-Actor-Id": "plan"})
+        self.assertEqual(shown.body["response_minutes_text"], "45 分钟")
+        bad = app.handle("POST", "/road_corridors", {"X-Actor-Id": "plan"}, json.dumps(self.route_payload(0, corridor_id="api-zero")).encode())
+        self.assertEqual(bad.status, 422)
+        clarified = app.handle("POST", "/road_corridors/api-45/clarify_duration", {"X-Actor-Id": "plan"}, b'{"response_minutes": 50}')
+        self.assertEqual(clarified.body["response_minutes"], 50)
+
+
+class LegacySchemaMigrationTests(unittest.TestCase):
+    def test_preexisting_minute_rows_stay_minutes_out_of_range_rows_flagged(self) -> None:
+        connection = sqlite3.connect(":memory:", isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            """
+            CREATE TABLE traffic_users (user_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, role TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+            CREATE TABLE response_centers (center_id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
+                timezone TEXT NOT NULL, capacity_units TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+            CREATE TABLE road_corridors (corridor_id TEXT PRIMARY KEY, origin_center_id TEXT NOT NULL,
+                destination_center_id TEXT NOT NULL, preservation_resource_kind TEXT NOT NULL,
+                hourly_capacity TEXT NOT NULL, delay_basis_points INTEGER NOT NULL,
+                response_minutes INTEGER NOT NULL, revision INTEGER NOT NULL DEFAULT 1,
+                state TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL);
+            CREATE TABLE dispatch_requests (dispatch_id TEXT PRIMARY KEY, corridor_id TEXT NOT NULL,
+                specimen_event_id TEXT NOT NULL, duty_date TEXT NOT NULL, requested_units TEXT NOT NULL,
+                allocated_units TEXT NOT NULL DEFAULT '0', arrived_units TEXT NOT NULL DEFAULT '0',
+                priority INTEGER NOT NULL, state TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1,
+                idempotency_key TEXT NOT NULL, submitted_by TEXT NOT NULL, submitted_at TEXT NOT NULL);
+            CREATE TABLE deployments (deployment_id TEXT PRIMARY KEY, dispatch_id TEXT NOT NULL,
+                inventory_preservation_resource_lot_id TEXT NOT NULL, deployed_units TEXT NOT NULL,
+                expected_arrived_units TEXT NOT NULL, departed_at TEXT NOT NULL, arrived_at TEXT,
+                state TEXT NOT NULL DEFAULT 'in_transit', revision INTEGER NOT NULL DEFAULT 1,
+                created_by TEXT NOT NULL, created_at TEXT NOT NULL);
+            INSERT INTO traffic_users VALUES ('plan','plan','planner',1,'2026-01-01T00:00:00Z');
+            INSERT INTO response_centers VALUES ('a','A','storage','UTC','1',1,'2026-01-01T00:00:00Z');
+            INSERT INTO response_centers VALUES ('b','B','receiving-vault','UTC','1',1,'2026-01-01T00:00:00Z');
+            INSERT INTO road_corridors VALUES ('ok','a','b','preservation-box','1',0,45,1,'active','2026-01-01T00:00:00Z');
+            INSERT INTO road_corridors VALUES ('huge','a','b','preservation-box','1',0,99999,1,'active','2026-01-01T00:00:00Z');
+            INSERT INTO dispatch_requests VALUES ('d-ok','ok','e','2026-01-01','1','1','0',10,'in_transit',1,'k','plan','2026-01-01T00:00:00Z');
+            INSERT INTO dispatch_requests VALUES ('d-huge','huge','e','2026-01-01','1','1','0',10,'in_transit',1,'k2','plan','2026-01-01T00:00:00Z');
+            INSERT INTO deployments VALUES ('dep-ok','d-ok','lot','1','1','2026-01-01T00:00:00Z',NULL,'in_transit',1,'plan','2026-01-01T00:00:00Z');
+            INSERT INTO deployments VALUES ('dep-huge','d-huge','lot','1','1','2026-01-01T00:00:00Z',NULL,'in_transit',1,'plan','2026-01-01T00:00:00Z');
+            """
+        )
+        initialize(connection)
+        service = CollectionLogisticsService(connection)
+        ok = service.route("ok")
+        self.assertEqual(ok["response_minutes"], 45)
+        self.assertEqual(ok["response_time_unit"], "minute")
+        self.assertFalse(ok["duration_ambiguous"])
+        huge = service.route("huge")
+        self.assertTrue(huge["duration_ambiguous"])
+        self.assertIsNone(huge["response_minutes"])
+        self.assertEqual(huge["legacy_response_time"], 99999)
+        # 明确分钟的旧部署按分钟回填 ETA（45 分钟，而非 45 小时）。
+        backfilled = connection.execute(
+            "SELECT expected_arrival_at FROM deployments WHERE deployment_id='dep-ok'"
+        ).fetchone()
+        self.assertEqual(backfilled["expected_arrival_at"], "2026-01-01T00:45:00Z")
+        # 单位不明的旧部署不猜测，ETA 保持为空。
+        not_backfilled = connection.execute(
+            "SELECT expected_arrival_at FROM deployments WHERE deployment_id='dep-huge'"
+        ).fetchone()
+        self.assertIsNone(not_backfilled["expected_arrival_at"])
+        connection.close()
 
 
 if __name__ == "__main__":

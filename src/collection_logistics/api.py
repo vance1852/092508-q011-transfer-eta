@@ -65,6 +65,10 @@ class JsonApplication:
                 return Response(201, self.service.create_facility(actor, payload))
             if method == "POST" and path == "/road_corridors":
                 return Response(201, self.service.create_route(actor, payload))
+            if method == "GET" and len(parts) == 2 and parts[0] == "road_corridors":
+                return Response(200, self.service.route(parts[1]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "road_corridors" and parts[2] == "clarify_duration":
+                return Response(200, self.service.clarify_route_duration(actor, parts[1], payload["response_minutes"]))
             if method == "POST" and len(parts) == 3 and parts[0] == "road_corridors" and parts[2] == "outages":
                 return Response(201, self.service.announce_restriction(actor, parts[1], payload["starts_at"], payload.get("ends_at"), payload["capacity_percent"], payload["reason"]))
             if method == "POST" and path == "/inventory/lots":
@@ -77,6 +81,10 @@ class JsonApplication:
                 return Response(200, self.service.allocate(actor, parts[1], payload["duty_date"]))
             if method == "POST" and path == "/deployments":
                 return Response(201, self.service.dispatch_deployment(actor, payload["deployment_id"], payload["dispatch_id"], payload["preservation_resource_lot_id"], int(payload["expected_revision"])))
+            if method == "GET" and len(parts) == 2 and parts[0] == "deployments":
+                return Response(200, self.service.deployment(parts[1], actor))
+            if method == "POST" and len(parts) == 3 and parts[0] == "deployments" and parts[2] == "arrival":
+                return Response(200, self.service.confirm_arrival(actor, parts[1], payload.get("arrived_at"), payload.get("arrived_units")))
             if method == "POST" and path == "/scenarios":
                 return Response(201, self.service.create_scenario(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "approve":

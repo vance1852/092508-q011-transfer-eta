@@ -5,13 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from datetime import timedelta
 from decimal import Decimal
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
-from .clock import SystemClock, parse_utc, utc_text
+from .clock import SystemClock, add_minutes, load_timezone, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario
+from .models import RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario, decimal_value, response_duration
 from .planning import (
     AllocationRequest,
     RiskPoint,
@@ -32,7 +31,7 @@ from .storage import initialize, transaction
 
 ROLE_PERMISSIONS = {
     "planner": {"risk_record.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"dispatch_request.write", "allocation.run", "deployment.write", "inventory.write"},
+    "dispatcher": {"dispatch_request.write", "allocation.run", "deployment.write", "inventory.write", "report.read"},
     "risk": {"outage.write", "scenario.approve", "report.read"},
     "auditor": {"report.read", "audit.read"},
 }
@@ -204,7 +203,7 @@ class CollectionLogisticsService:
             with transaction(self.connection, immediate=True):
                 self.connection.execute(
                     "INSERT INTO road_corridors(corridor_id,origin_center_id,destination_center_id,preservation_resource_kind,hourly_capacity,"
-                    "delay_basis_points,response_minutes,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    "delay_basis_points,response_minutes,response_time_unit,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                     (
                         route.corridor_id,
                         route.origin_center_id,
@@ -213,6 +212,7 @@ class CollectionLogisticsService:
                         decimal_text(route.hourly_capacity),
                         route.delay_basis_points,
                         route.response_minutes,
+                        route.response_time_unit,
                         self._now(),
                     ),
                 )
@@ -221,11 +221,56 @@ class CollectionLogisticsService:
             raise Conflict("转运路线编号冲突或设施不存在") from exc
         return self.route(route.corridor_id)
 
+    def clarify_route_duration(self, actor_id: str, corridor_id: str, response_minutes: object) -> dict[str, Any]:
+        """人工澄清旧记录中单位不明的响应时长；澄清值一律按分钟登记。"""
+        self._require(actor_id, "catalog.write")
+        minutes = response_duration(response_minutes, "response_minutes")
+        existing = self.connection.execute(
+            "SELECT response_time_unit FROM road_corridors WHERE corridor_id=?", (corridor_id,)
+        ).fetchone()
+        if existing is None:
+            raise NotFound("转运路线不存在")
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE road_corridors SET response_minutes=?,response_time_unit='minute',"
+                "legacy_response_time=NULL,revision=revision+1 WHERE corridor_id=?",
+                (minutes, corridor_id),
+            )
+            if cursor.rowcount != 1:  # pragma: no cover - 并发行锁保护
+                raise InvalidState("转运路线状态已变化，请重试")
+            self._audit(
+                "route", corridor_id, "route.duration_clarified", actor_id, {"response_minutes": minutes}
+            )
+        return self.route(corridor_id)
+
     def route(self, corridor_id: str) -> dict[str, Any]:
         row = self.connection.execute("SELECT * FROM road_corridors WHERE corridor_id=?", (corridor_id,)).fetchone()
         if row is None:
             raise NotFound("转运路线不存在")
-        return dict(row)
+        return self._route_view(row)
+
+    @staticmethod
+    def _route_view(row: sqlite3.Row) -> dict[str, Any]:
+        """路线登记、任务调度、API 展示与历史读取共用同一时长语义。"""
+        view = dict(row)
+        ambiguous = row["response_time_unit"] == "ambiguous"
+        minutes = None if ambiguous else int(row["response_minutes"])
+        view["response_minutes"] = minutes
+        view["response_time_unit"] = row["response_time_unit"]
+        view["duration_ambiguous"] = ambiguous
+        if ambiguous:
+            raw = row["response_minutes"] if "response_minutes" in row.keys() else None
+            view["duration_note"] = (
+                "响应时长缺少明确单位，已标记 ambiguous，澄清前禁止调度"
+                + ("" if raw is None else f"（原始登记值 {raw} 未做单位换算）")
+            )
+            view["response_minutes_text"] = None
+            view["response_hours"] = None
+        else:
+            view["duration_note"] = f"约 {minutes} 分钟"
+            view["response_minutes_text"] = f"{minutes} 分钟"
+            view["response_hours"] = format(Decimal(minutes) / Decimal(60), ".2f").rstrip("0").rstrip(".")
+        return view
 
     def announce_restriction(
         self,
@@ -312,6 +357,10 @@ class CollectionLogisticsService:
         route = self.route(dispatch_request.corridor_id)
         if route["state"] != "active":
             raise InvalidState("转运路线当前不可调度申请")
+        if route["duration_ambiguous"]:
+            raise InvalidState(
+                "转运路线响应时长单位不明（ambiguous），请先由馆员澄清 response_minutes 后再调度"
+            )
         response = {
             "dispatch_id": dispatch_request.dispatch_id,
             "corridor_id": dispatch_request.corridor_id,
@@ -414,14 +463,23 @@ class CollectionLogisticsService:
     ) -> dict[str, Any]:
         self._require(actor_id, "deployment.write")
         dispatch_request = self.connection.execute(
-            "SELECT n.*,r.delay_basis_points,r.response_minutes,r.origin_center_id FROM dispatch_requests n "
-            "JOIN road_corridors r ON r.corridor_id=n.corridor_id WHERE n.dispatch_id=?",
+            "SELECT n.*,r.delay_basis_points,r.response_minutes,r.response_time_unit,"
+            "r.origin_center_id,c.timezone AS destination_timezone "
+            "FROM dispatch_requests n "
+            "JOIN road_corridors r ON r.corridor_id=n.corridor_id "
+            "JOIN response_centers c ON c.center_id=r.destination_center_id "
+            "WHERE n.dispatch_id=?",
             (dispatch_id,),
         ).fetchone()
         if dispatch_request is None:
             raise NotFound("调度申请不存在")
         if dispatch_request["state"] != "allocated" or dispatch_request["revision"] != expected_revision:
             raise InvalidState("调度申请不是当前可资源到场版本")
+        if dispatch_request["response_time_unit"] == "ambiguous":
+            raise InvalidState(
+                "转运路线响应时长单位不明（ambiguous），无法计算预计到达时间，请先澄清"
+            )
+        response_minutes = int(dispatch_request["response_minutes"])
         lot = self.connection.execute("SELECT * FROM preservation_resource_lots WHERE preservation_resource_lot_id=?", (preservation_resource_lot_id,)).fetchone()
         if lot is None:
             raise NotFound("应急资源批次不存在")
@@ -432,7 +490,11 @@ class CollectionLogisticsService:
         if available < allocated:
             raise Conflict("应急资源库存不足以完成分配")
         expected_delivery = delivered_after_loss(allocated, int(dispatch_request["delay_basis_points"]))
-        departed_at = self._now()
+        departed_dt = self.clock.now()
+        departed_at = utc_text(departed_dt)
+        expected_arrival_dt = add_minutes(departed_dt, response_minutes)
+        expected_arrival = utc_text(expected_arrival_dt)
+        destination_zone = load_timezone(dispatch_request["destination_timezone"], "destination timezone")
         with transaction(self.connection, immediate=True):
             self.connection.execute(
                 "UPDATE preservation_resource_lots SET available_units=?,revision=revision+1 WHERE preservation_resource_lot_id=? AND revision=?",
@@ -444,7 +506,8 @@ class CollectionLogisticsService:
             )
             self.connection.execute(
                 "INSERT INTO deployments(deployment_id,dispatch_id,inventory_preservation_resource_lot_id,deployed_units,"
-                "expected_arrived_units,departed_at,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                "expected_arrived_units,departed_at,expected_arrival_at,created_by,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
                 (
                     deployment_id,
                     dispatch_id,
@@ -452,6 +515,7 @@ class CollectionLogisticsService:
                     decimal_text(allocated),
                     decimal_text(expected_delivery),
                     departed_at,
+                    expected_arrival,
                     actor_id,
                     departed_at,
                 ),
@@ -462,8 +526,94 @@ class CollectionLogisticsService:
             "state": "in_transit",
             "deployed_units": decimal_text(allocated),
             "expected_arrived_units": decimal_text(expected_delivery),
-            "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=int(dispatch_request["response_minutes"]))),
+            "departed_at": departed_at,
+            "expected_arrival": expected_arrival,
+            "expected_arrival_timezone": dispatch_request["destination_timezone"],
+            "expected_arrival_local": expected_arrival_dt.astimezone(destination_zone).isoformat(),
+            "response_minutes": response_minutes,
         }
+
+    def deployment(self, deployment_id: str, actor_id: str) -> dict[str, Any]:
+        """历史读取：以同一分钟语义展示 ETA、接收端本地时刻与超时判断。"""
+        self._require(actor_id, "report.read")
+        row = self.connection.execute(
+            "SELECT d.*,r.response_minutes,r.response_time_unit,c.timezone AS destination_timezone "
+            "FROM deployments d "
+            "JOIN dispatch_requests n ON n.dispatch_id=d.dispatch_id "
+            "JOIN road_corridors r ON r.corridor_id=n.corridor_id "
+            "JOIN response_centers c ON c.center_id=r.destination_center_id "
+            "WHERE d.deployment_id=?",
+            (deployment_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFound("转运任务不存在")
+        view: dict[str, Any] = {
+            key: row[key]
+            for key in (
+                "deployment_id", "dispatch_id", "state", "deployed_units", "expected_arrived_units",
+                "departed_at", "expected_arrival_at", "arrived_at",
+            )
+        }
+        if row["expected_arrival_at"] is None or row["response_time_unit"] == "ambiguous":
+            view["duration_ambiguous"] = True
+            view["overdue"] = None
+            view["expected_arrival_local"] = None
+            return view
+        arrival_dt = parse_utc(row["expected_arrival_at"], "expected_arrival_at")
+        destination_zone = load_timezone(row["destination_timezone"], "destination timezone")
+        view["duration_ambiguous"] = False
+        view["response_minutes"] = int(row["response_minutes"])
+        view["expected_arrival"] = row["expected_arrival_at"]
+        view["expected_arrival_timezone"] = row["destination_timezone"]
+        view["expected_arrival_local"] = arrival_dt.astimezone(destination_zone).isoformat()
+        # 超时判断只发生在 UTC 时间线上：now 与 ETA 都是带时区绝对时刻，
+        # 跨日与夏令时切换不会让判定漂移。
+        if row["state"] == "delivered" and row["arrived_at"] is not None:
+            view["overdue"] = parse_utc(row["arrived_at"], "arrived_at") > arrival_dt
+        else:
+            view["overdue"] = self.clock.now() > arrival_dt
+        return view
+
+    def confirm_arrival(
+        self,
+        actor_id: str,
+        deployment_id: str,
+        arrived_at: str | None = None,
+        arrived_units: object = None,
+    ) -> dict[str, Any]:
+        """接收端登记实际到达时刻（带时区）与实际收到数量，供超时判断与排班复盘。"""
+        self._require(actor_id, "deployment.write")
+        row = self.connection.execute(
+            "SELECT * FROM deployments WHERE deployment_id=?", (deployment_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("转运任务不存在")
+        if row["state"] != "in_transit":
+            raise InvalidState("只有在途任务可以确认到达")
+        arrived_dt = self.clock.now() if arrived_at is None else parse_utc(arrived_at, "arrived_at")
+        if arrived_at is not None and arrived_dt < parse_utc(row["departed_at"], "departed_at"):
+            raise ValidationFailed("arrived_at 不能早于 departed_at")
+        units = (
+            Decimal(row["expected_arrived_units"])
+            if arrived_units is None
+            else decimal_value(arrived_units, "arrived_units", minimum=Decimal("0"))
+        )
+        arrived_text = utc_text(arrived_dt)
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "UPDATE deployments SET arrived_at=?,state='delivered',revision=revision+1 "
+                "WHERE deployment_id=? AND state='in_transit'",
+                (arrived_text, deployment_id),
+            )
+            self.connection.execute(
+                "UPDATE dispatch_requests SET arrived_units=?,state='delivered',revision=revision+1 "
+                "WHERE dispatch_id=?",
+                (decimal_text(quantize_volume(units)), row["dispatch_id"]),
+            )
+            self._audit(
+                "deployment", deployment_id, "deployment.arrived", actor_id, {"arrived_at": arrived_text}
+            )
+        return self.deployment(deployment_id, actor_id)
 
     def create_scenario(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "scenario.write")

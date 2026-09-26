@@ -47,3 +47,12 @@ PYTHONPATH=src python3 -m biosafety_ops.api --database biosafety.sqlite3 --host 
 ```
 
 三个服务均提供 `GET /health`，其余接口使用 JSON。SQLite 文件保存业务状态、幂等结果和审计记录，进程重启后可以继续查询与复核。
+
+## 转运响应时长语义
+
+- 转运路线的响应时长统一以**分钟**登记：字段 `response_minutes`，必须是 1..1440（24 小时）的整数；零、负数、浮点、布尔和超出范围的值在写入前一律拒绝。
+- 兼容旧记录的登记接口接受 `response_time` + `response_time_unit`（`minute` 或 `hour`），入库时归一化为分钟。`response_time_unit` 为 `unknown`（或无法识别单位）时，该路线标记为 `duration_ambiguous`，**禁止提交调度申请和计算预计到达时间**，需馆员调用 `POST /road_corridors/{id}/clarify_duration` 明确分钟数后才恢复可用；系统不会在分钟与小时之间猜测。
+- 预计到达时间从带时区的出发时刻在 UTC 时间线上加 `response_minutes` 分钟得到，并同时给出接收设施时区的本地时刻，因此跨日与夏令时切换（春令时拨表等）不会造成一小时的偏差。
+- `GET /road_corridors/{id}` 与 `GET /deployments/{id}` 使用同一语义展示分钟数、本地预计到达时刻和 `overdue` 超时判断；接收端可用 `POST /deployments/{id}/arrival` 登记实际到达时刻。
+- 打开旧版 SQLite 数据库时自动迁移：既有分钟值保持分钟语义；超出合理范围的旧值原值保留在 `legacy_response_time` 并标记 `ambiguous`；历史部署的预计到达时间仅在单位明确时按分钟回填。
+
